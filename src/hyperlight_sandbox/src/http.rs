@@ -6,11 +6,17 @@
 //! `default_send_request_handler` under the hood.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
+
+// Only the wasmtime-backed `send_http_request` impl needs these; with `wasi-http` off
+// (the Unikraft/workerd build) the stub below is used instead.
+#[cfg(feature = "wasi-http")]
+use anyhow::Context;
+#[cfg(feature = "wasi-http")]
+use std::time::Duration;
 
 /// Body type for outgoing sandbox HTTP requests.
 ///
@@ -111,6 +117,7 @@ pub struct HttpResponse {
 /// This is an **async** function. Use with [`BlockOn::block_on`](crate::runtime::BlockOn)
 /// from sync contexts (e.g. JS sandbox host callbacks) or `.await` / `.spawn()`
 /// from async contexts (e.g. WASM handler).
+#[cfg(feature = "wasi-http")]
 pub async fn send_http_request(req: HttpRequest) -> Result<HttpResponse> {
     let (hyper_request, use_tls) = build_hyper_request(req)?;
 
@@ -154,7 +161,17 @@ pub async fn send_http_request(req: HttpRequest) -> Result<HttpResponse> {
     })
 }
 
+/// Stub used when the `wasi-http` feature is disabled (e.g. the Unikraft backend in
+/// workerd, which routes outbound HTTP through the host rather than a guest-side client).
+/// Keeps the public signature stable so backends compile without `wasmtime-wasi-http`.
+#[cfg(not(feature = "wasi-http"))]
+#[allow(clippy::unused_async)]
+pub async fn send_http_request(_req: HttpRequest) -> Result<HttpResponse> {
+    anyhow::bail!("outbound HTTP is unavailable: the `wasi-http` feature is disabled")
+}
+
 /// Build a `hyper::Request` from an [`HttpRequest`], stripping forbidden headers.
+#[cfg(feature = "wasi-http")]
 fn build_hyper_request(req: HttpRequest) -> Result<(hyper::Request<RequestBody>, bool)> {
     let method = hyper::Method::from_bytes(req.method.as_bytes())
         .map_err(|e| anyhow::anyhow!("invalid HTTP method: {e}"))?;
@@ -193,6 +210,7 @@ fn build_hyper_request(req: HttpRequest) -> Result<(hyper::Request<RequestBody>,
 }
 
 /// Extract response headers, enforcing count and byte-size limits.
+#[cfg(feature = "wasi-http")]
 fn cap_response_headers(raw: &http::HeaderMap) -> HashMap<String, String> {
     let mut headers = HashMap::new();
     let mut total_bytes: usize = 0;
@@ -212,6 +230,7 @@ fn cap_response_headers(raw: &http::HeaderMap) -> HashMap<String, String> {
 }
 
 /// Collect a hyper response body up to [`MAX_RESPONSE_BYTES`].
+#[cfg(feature = "wasi-http")]
 async fn collect_response_body(
     mut body: wasmtime_wasi_http::p2::body::HyperIncomingBody,
     between_bytes_timeout: Duration,

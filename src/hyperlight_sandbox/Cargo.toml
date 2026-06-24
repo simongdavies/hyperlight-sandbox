@@ -21,7 +21,7 @@ serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros"] }
 url = "2"
-wasmtime-wasi-http = "44.0.0"
+wasmtime-wasi-http = { version = "44.0.0", optional = true }
 
 [dev-dependencies]
 futures-util = "0.3"
@@ -30,4 +30,9 @@ proptest = "1"
 tokio = { version = "1", features = ["full"] }
 
 [features]
+default = ["wasi-http"]
+# Host-side outbound HTTP (`send_http_request`) via wasmtime-wasi-http. Enabled by default
+# for the wasm/js backends. The Unikraft backend builds with this OFF so workerd doesn't
+# pull the wasmtime stack into its V8 runtime; outbound HTTP there goes via the host.
+wasi-http = ["dep:wasmtime-wasi-http"]
 test-utils = []
