@@ -1944,7 +1944,7 @@ dependencies = [
 [[package]]
 name = "hyperlight-unikraft-host"
 version = "0.9.0"
-source = "git+https://github.com/simongdavies/hyperlight-unikraft?branch=feat%2Fhyperlight-sandbox-backend#1d88a161cb2fcaeb3525f15a9e2afacb5f55c61b"
+source = "git+https://github.com/simongdavies/hyperlight-unikraft?rev=1d88a161cb2fcaeb3525f15a9e2afacb5f55c61b#1d88a161cb2fcaeb3525f15a9e2afacb5f55c61b"
 dependencies = [
  "anyhow",
  "base64",
