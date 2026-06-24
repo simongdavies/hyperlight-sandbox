@@ -1,0 +1,26 @@
+[package]
+name = "hyperlight-unikraft-sandbox"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+description = "hyperlight-sandbox backend that runs guests inside Unikraft micro-VMs on Hyperlight."
+
+[dependencies]
+# Host-agnostic core of hyperlight-sandbox (the `Guest`/`GuestSandbox` traits + the shared
+# capability model). A direct path dep (not workspace inheritance) so `default-features =
+# false` actually takes effect — it drops the `wasi-http` feature (and the wasmtime stack);
+# the Unikraft backend never does guest-side host HTTP, so consumers like workerd stay
+# wasmtime-free.
+hyperlight-sandbox = { path = "../hyperlight_sandbox", default-features = false }
+
+# The embedded Hyperlight + Unikraft host library (crate `hyperlight-unikraft-host`, lib
+# name `hyperlight_unikraft`). Lives in the hyperlight-unikraft repo (atop the
+# danbugs/hyperlight fork) and brings the snapshot-file + warm-start support this backend
+# relies on.
+hyperlight-unikraft-host = { git = "https://github.com/simongdavies/hyperlight-unikraft", branch = "feat/hyperlight-sandbox-backend" }
+
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"

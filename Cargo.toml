@@ -3,6 +3,7 @@ members = [
 	"src/hyperlight_sandbox",
 	"src/javascript_sandbox",
 	"src/wasm_sandbox",
+	"src/unikraft_sandbox",
 	"src/sdk/python/pyo3_common",
 	"src/sdk/python/wasm_backend",
 	"src/sdk/python/hyperlight_js_backend",
@@ -20,6 +21,7 @@ license = "Apache-2.0"
 hyperlight-sandbox = { path = "src/hyperlight_sandbox" }
 hyperlight-javascript-sandbox = { path = "src/javascript_sandbox" }
 hyperlight-wasm-sandbox = { path = "src/wasm_sandbox" }
+hyperlight-unikraft-sandbox = { path = "src/unikraft_sandbox" }
 hyperlight-sandbox-pyo3-common = { path = "src/sdk/python/pyo3_common" }
 hyperlight-common = { version = "0.14.0", default-features = false }
 hyperlight-component-macro = { version = "0.14.0" }
