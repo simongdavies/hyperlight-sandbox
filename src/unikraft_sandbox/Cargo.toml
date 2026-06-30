@@ -15,13 +15,12 @@ description = "hyperlight-sandbox backend that runs guests inside Unikraft micro
 hyperlight-sandbox = { path = "../hyperlight_sandbox", default-features = false }
 
 # The embedded Hyperlight + Unikraft host library (lib name `hyperlight_unikraft`).
-# RE-POINTED 2026-06-30 from the simongdavies/hyperlight-unikraft fork rev (atop the
-# danbugs/hyperlight warm-start fork, which BREAKS post-restore guest execution on WHP) to
-# the RELEASED crates.io crate, proven to execute + capture stdout on Windows/WHP.
-# Package renamed `hyperlight-unikraft-host` (fork) -> `hyperlight-unikraft` (released); both
-# expose lib `hyperlight_unikraft`, so `use hyperlight_unikraft::...` is unchanged.
-# NOTE: the released API may differ from the fork's — the build surfaces the port gaps.
-hyperlight-unikraft = "0.11.0"
+# Points at the simongdavies/hyperlight-unikraft fork branch `feat/plex-run-capture`: the
+# RELEASED 0.11.0 base (off upstream/main, hyperlight-host 0.16.0, WHP-proven) PLUS the
+# library run+capture work — `Sandbox::run_code(code)` for per-call code delivery (C1),
+# with stdout in-band capture (C2) and a `from_snapshot` factory (D1) to follow. Pinned to
+# the branch until upstreamed.
+hyperlight-unikraft = { git = "https://github.com/simongdavies/hyperlight-unikraft", branch = "feat/plex-run-capture" }
 
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

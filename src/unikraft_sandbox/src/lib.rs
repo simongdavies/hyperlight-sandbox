@@ -31,21 +31,24 @@
 //!
 //! # Execution model
 //!
-//! Each [`run`](GuestSandbox::run) launches the guest interpreter with the code passed as
-//! argv — `<code_flag> <code>`, e.g. `python3 -c <code>` (the default; use `-e` for Node).
-//! This mirrors the `hyperlight-unikraft` CLI's `--exec` flag. The guest writes stdout /
-//! stderr to the VM console (port `0xE9`), which Hyperlight routes to the host; the backend
-//! captures it for the duration of the call and returns it as the [`ExecutionResult`]
-//! `stdout`.
+//! The guest is a **resident driver**: the kernel + initrd boot a long-lived interpreter
+//! (e.g. CPython) that initialises once and then waits for work on Hyperlight's `run`
+//! function. The driver boots lazily on the first [`run`](GuestSandbox::run) and stays
+//! resident; each call delivers its code to the driver via
+//! [`Sandbox::run_code`](hyperlight_unikraft::Sandbox::run_code), which rewinds to the warm
+//! post-init snapshot, runs the code, and returns the guest exit code.
 //!
-//! Because the code is baked into the boot argv, the VM is (re-)evolved when the code
-//! changes. A VM is cached and **warm-reused** while the code is unchanged: the first call
-//! pays the kernel boot + interpreter start-up (`build`, seconds), and subsequent calls of
-//! the same code are a fast `restore` + `call_run` (hundreds of ms). [`snapshot`] /
+//! So the first call pays the kernel boot + interpreter start-up (`build`, seconds) and
+//! every subsequent call — *whatever the code* — is a warm rewind + run. [`snapshot`] /
 //! [`restore`] checkpoint that warm VM.
 //!
-//! Point [`Unikraft`] at any kernel + initrd whose entry interpreter accepts the
-//! `<code_flag> <code>` convention (the upstream `examples/python` image is the reference).
+//! The guest still writes stdout / stderr to the VM console (port `0xE9`), which Hyperlight
+//! routes to the host's `fd 2`. In-band, per-call capture of that output into the
+//! [`ExecutionResult`] `stdout` is **not wired yet** (see the limitations below), so for now
+//! `stdout` is returned empty and the `exit_code` is authoritative.
+//!
+//! Point [`Unikraft`] at a kernel + initrd built as a resident driver that exposes a `run`
+//! function taking the code string (the `python-agent-driver` image is the reference).
 //!
 //! [`snapshot`]: GuestSandbox::snapshot
 //! [`restore`]: GuestSandbox::restore
@@ -55,24 +58,21 @@
 //! This is an early backend; some shortcuts were taken to get an end-to-end Python run
 //! working. Each is flagged at its site with a `TODO` and summarised here:
 //!
-//! - **Distinct code re-evolves the VM (~seconds).** The code is baked into the boot argv,
-//!   so each new code string boots a fresh VM. Repeats of the same code are warm (~hundreds
-//!   of ms). TODO: a resident-driver image that accepts code per call (over `__dispatch`)
-//!   would make every call warm.
-//! - **Console capture is process-global.** stdout is captured by redirecting the host
-//!   process's `fd 2` (see [`stderr_capture`]) around each call. A process-wide lock
-//!   serialises concurrent sandboxes, and on Windows the redirect is a no-op (no capture).
-//!   TODO: an in-guest capture returned from the call would be per-call and portable.
+//! - **`stdout` is not captured yet.** The guest console (port `0xE9`) is routed straight to
+//!   the host's `fd 2`; the released crate's console redirect is a no-op on Windows, so the
+//!   backend returns an empty `stdout` and relies on the `exit_code`. TODO (C2): have the
+//!   resident driver return the captured output in-band per call — per-call and portable.
 //! - **Capability globals require a guest preamble.** The host registers `call_tool` /
 //!   `read_file` / `write_file` / `fetch` over `__dispatch`, but a plain interpreter image
-//!   (e.g. `examples/python`) exposes no matching guest globals, so guest code cannot reach
-//!   them yet — use a [`mount`](Unikraft::mount) for host filesystem access instead. TODO:
-//!   ship a guest preamble that binds these globals.
+//!   exposes no matching guest globals, so guest code cannot reach them yet — use a
+//!   [`mount`](Unikraft::mount) for host filesystem access instead. TODO: ship a guest
+//!   preamble that binds these globals.
 //! - **Scoped credentials are ignored** by `fetch`. TODO: credential-aware outgoing HTTP.
-//! - **Build wiring is local-checkout-specific:** the crate path-depends on sibling
-//!   checkouts of `hyperlight-sandbox` (currently its `feat/scoped-credentials` branch)
-//!   and `hyperlight-unikraft/host`, and pins toolchain 1.94 (the core needs ≥1.92 while
-//!   the host repo pins 1.89). TODO: switch to versioned/git deps for release.
+//! - **Build wiring pins a fork branch:** the crate path-depends on the sibling
+//!   `hyperlight-sandbox` core checkout, and git-depends on
+//!   `simongdavies/hyperlight-unikraft` branch `feat/plex-run-capture` (the released 0.11.0
+//!   base plus `run_code`). TODO: switch to the upstream/crates.io release once the run
+//!   capture work is merged.
 //!
 //! [`hyperlight-sandbox`]: hyperlight_sandbox
 
@@ -86,15 +86,9 @@ use hyperlight_sandbox::{
     http as sandbox_http, CapFs, CredentialRegistry, ExecutionResult, Guest, GuestSandbox,
     HttpMethod, NetworkPermissions, SandboxConfig, Snapshot, ToolRegistry,
 };
-use hyperlight_unikraft::{
-    stderr_capture, Preopen, Sandbox as UnikraftVm, SandboxBuilder,
-};
+use hyperlight_unikraft::{Preopen, Sandbox as UnikraftVm, SandboxBuilder};
 use serde::Deserialize;
 use serde_json::{json, Value};
-
-/// Default interpreter flag used to pass the code string as argv (e.g. `python3 -c <code>`,
-/// `node -e <code>`). Override with [`Unikraft::code_flag`].
-const DEFAULT_CODE_FLAG: &str = "-c";
 
 /// Default guest heap size (512 MiB).
 ///
@@ -129,7 +123,6 @@ const DEFAULT_STACK_SIZE: u64 = 8 * 1024 * 1024;
 pub struct Unikraft {
     kernel: PathBuf,
     initrd: Option<PathBuf>,
-    code_flag: String,
     heap_size: u64,
     stack_size: u64,
     initrd_base: Option<u64>,
@@ -143,7 +136,6 @@ impl Unikraft {
         Self {
             kernel: kernel.into(),
             initrd: None,
-            code_flag: DEFAULT_CODE_FLAG.to_string(),
             heap_size: DEFAULT_HEAP_SIZE,
             stack_size: DEFAULT_STACK_SIZE,
             initrd_base: None,
@@ -154,13 +146,6 @@ impl Unikraft {
     /// Attach the initrd/rootfs CPIO image, mapped zero-copy into guest memory.
     pub fn initrd(mut self, path: impl Into<PathBuf>) -> Self {
         self.initrd = Some(path.into());
-        self
-    }
-
-    /// Override the interpreter flag used to pass code as argv. Defaults to `"-c"`
-    /// (CPython / `sh`); use `"-e"` for a Node.js guest (`node -e <code>`).
-    pub fn code_flag(mut self, flag: impl Into<String>) -> Self {
-        self.code_flag = flag.into();
         self
     }
 
@@ -214,13 +199,13 @@ impl Guest for Unikraft {
     }
 }
 
-/// A built Unikraft sandbox. Holds the boot configuration and capability bridge; each
-/// [`run`](GuestSandbox::run) (re-)evolves a micro-VM with the code baked into argv and
-/// captures its console output. The VM is cached and warm-reused while the code is unchanged.
+/// A built Unikraft sandbox. Holds the boot configuration and capability bridge. The guest
+/// driver boots once (lazily, on first [`run`](GuestSandbox::run)) and stays **resident**;
+/// each subsequent run delivers its code via `Sandbox::run_code` against the warm post-init
+/// snapshot, so there is no per-code re-evolve.
 pub struct UnikraftGuestSandbox {
     kernel: PathBuf,
     initrd: Option<PathBuf>,
-    code_flag: String,
     heap_size: u64,
     stack_size: u64,
     initrd_base: Option<u64>,
@@ -228,13 +213,8 @@ pub struct UnikraftGuestSandbox {
     tools: Arc<ToolRegistry>,
     network: Arc<Mutex<NetworkPermissions>>,
     fs: Arc<Mutex<CapFs>>,
-    current: Option<CurrentVm>,
-}
-
-/// A live VM together with the code it was evolved for, enabling warm restore + re-run.
-struct CurrentVm {
-    code: String,
-    vm: UnikraftVm,
+    /// The resident micro-VM, booted lazily on first run and warm-reused thereafter.
+    vm: Option<UnikraftVm>,
 }
 
 /// Options accepted by the host `fetch` tool. Mirrors the JS backend's `FetchOptions`.
@@ -250,22 +230,6 @@ struct FetchOptions {
 
 fn default_get_method() -> String {
     "GET".to_string()
-}
-
-/// Escape `code` so the guest's argparse tokeniser preserves it as a single argv entry,
-/// regardless of embedded whitespace or quotes. Wraps in `"..."` and backslash-escapes
-/// internal `\` and `"` — mirrors the `hyperlight-unikraft` CLI's `--exec` handling.
-fn argparse_escape(code: &str) -> String {
-    let mut out = String::with_capacity(code.len() + 4);
-    out.push('"');
-    for ch in code.chars() {
-        if ch == '\\' || ch == '"' {
-            out.push('\\');
-        }
-        out.push(ch);
-    }
-    out.push('"');
-    out
 }
 
 /// Build the host-side `__dispatch` tool registry that bridges the core sandbox
@@ -414,15 +378,14 @@ impl UnikraftGuestSandbox {
         let Unikraft {
             kernel,
             initrd,
-            code_flag,
             heap_size,
             stack_size,
             initrd_base,
             mounts,
         } = backend;
 
-        // Map requested host directories to guest `hostfs` preopens once; re-applied on
-        // every evolve.
+        // Map requested host directories to guest `hostfs` preopens once; applied when the
+        // resident VM is built.
         let preopens: Vec<Preopen> = mounts
             .iter()
             .map(|(host, guest)| Preopen::new(host, guest.clone()))
@@ -431,7 +394,6 @@ impl UnikraftGuestSandbox {
         Ok(Self {
             kernel,
             initrd,
-            code_flag,
             heap_size,
             stack_size,
             initrd_base,
@@ -439,22 +401,16 @@ impl UnikraftGuestSandbox {
             tools: Arc::new(tools),
             network,
             fs,
-            current: None,
+            vm: None,
         })
     }
 
-    /// Evolve a fresh micro-VM with `code` baked into the interpreter argv
-    /// (`<code_flag> <code>`), wiring the host capability tools and any preopened mounts.
-    /// `build()` boots the kernel + runtime and captures the post-init warm snapshot that
-    /// [`run_impl`](Self::run_impl) rewinds to before each `call_run`.
-    fn evolve_for(&self, code: &str) -> Result<UnikraftVm> {
-        // `--exec`-style invocation: the guest interpreter is launched as
-        // `<code_flag> <code>` (e.g. `python3 -c <code>`). The code is argparse-escaped so
-        // the guest tokeniser keeps it as a single argv entry regardless of spaces/quotes.
-        let args = vec![self.code_flag.clone(), argparse_escape(code)];
-
+    /// Boot the resident guest driver once: a kernel + runtime with the host capability
+    /// tools and any preopened mounts wired in, but **no code in argv**. `build()` runs the
+    /// driver's init and captures the post-init warm snapshot that
+    /// [`run_code`](hyperlight_unikraft::Sandbox::run_code) rewinds to before each call.
+    fn evolve(&self) -> Result<UnikraftVm> {
         let mut builder = UnikraftVm::builder(&self.kernel)
-            .args(args)
             .heap_size(self.heap_size)
             .stack_size(self.stack_size);
         // Bridge the core capabilities onto the builder's `__dispatch` host functions. The
@@ -475,23 +431,13 @@ impl UnikraftGuestSandbox {
         for preopen in &self.preopens {
             builder = builder.preopen(preopen.clone());
         }
-        builder.build().context("failed to evolve Unikraft VM")
+        builder.build().context("failed to boot Unikraft VM")
     }
 
     fn run_impl(&mut self, code: &str) -> Result<ExecutionResult> {
-        // (Re-)evolve only when the code changes: the baked-in argv means a distinct code
-        // needs a fresh boot, while a repeat of the same code is a fast warm restore.
-        if self
-            .current
-            .as_ref()
-            .map(|c| c.code != code)
-            .unwrap_or(true)
-        {
-            let vm = self.evolve_for(code)?;
-            self.current = Some(CurrentVm {
-                code: code.to_string(),
-                vm,
-            });
+        // Boot the resident driver on first use; warm-reuse it thereafter.
+        if self.vm.is_none() {
+            self.vm = Some(self.evolve()?);
         }
 
         // Clear the core `/output` staging area (a no-op when only hostfs mounts are used).
@@ -499,44 +445,27 @@ impl UnikraftGuestSandbox {
             files.clear_output_files();
         }
 
-        let current = self.current.as_mut().expect("current VM set above");
+        let vm = self.vm.as_mut().expect("resident VM booted above");
 
-        // Rewind to the post-init warm snapshot, then run the app via `call_run`. Unikraft
-        // routes the guest console (stdout/stderr, port 0xE9) to the host's fd 2, so we
-        // redirect fd 2 to a temp file for the duration of the call and read it back as
-        // `stdout`. `stderr_capture` serialises this with a process-wide lock.
+        // `run_code` rewinds to the post-init warm snapshot, delivers `code` to the resident
+        // driver via the `run` guest function, and returns the guest exit code.
         //
-        // TODO: process-global capture is not concurrency-friendly and is a no-op on
-        // Windows; an in-guest capture returned from the call would be per-call and portable.
-        current.vm.restore().context("failed to rewind warm VM")?;
-        current.vm.reset_exit_code();
-
-        let capture_path = std::env::temp_dir().join(format!(
-            "hl-unikraft-sandbox-{}-{:?}.out",
-            std::process::id(),
-            std::thread::current().id(),
-        ));
-        let capture = stderr_capture::Capture::redirect_to_file(&capture_path)?;
-        let call_result = current.vm.call_run();
-        // Restore stderr before reading the captured file or doing anything else.
-        capture.restore()?;
-
-        let stdout = std::fs::read_to_string(&capture_path).unwrap_or_default();
-        let _ = std::fs::remove_file(&capture_path);
-        let exit_code = current.vm.last_exit_code();
-
-        match call_result {
-            Ok(()) => Ok(ExecutionResult {
-                stdout,
+        // TODO (C2): stdout is not yet captured in-band — the guest console (port 0xE9) is
+        // routed straight to the host's fd 2 and the released crate's `stderr_capture` is a
+        // Windows no-op. Until the driver returns the captured output per call, `stdout` is
+        // left empty; the exit code is authoritative.
+        match vm.run_code(code) {
+            Ok(exit_code) => Ok(ExecutionResult {
+                stdout: String::new(),
                 stderr: String::new(),
                 exit_code,
             }),
-            // A guest trap surfaces as a failed execution (with whatever console output
-            // preceded it) rather than a hard error, matching the JS backend.
+            // A guest trap surfaces as a failed execution rather than a hard error, matching
+            // the JS backend.
             Err(error) => Ok(ExecutionResult {
-                stdout,
+                stdout: String::new(),
                 stderr: error.to_string(),
-                exit_code: if exit_code != 0 { exit_code } else { -1 },
+                exit_code: -1,
             }),
         }
     }
@@ -555,23 +484,20 @@ impl GuestSandbox for UnikraftGuestSandbox {
         // Re-capture the current guest state of the live VM as the checkpoint that future
         // `restore` calls rewind to. NOTE: only one checkpoint is retained, so a later
         // `snapshot` supersedes an earlier one — multi-snapshot stacking is not supported.
-        let current = self
-            .current
+        let vm = self
+            .vm
             .as_mut()
             .ok_or_else(|| anyhow!("snapshot() called before any run()"))?;
-        current
-            .vm
-            .snapshot_now()
-            .context("failed to capture snapshot")?;
+        vm.snapshot_now().context("failed to capture snapshot")?;
         Ok(Snapshot::new("hyperlight-unikraft", Arc::new(())))
     }
 
     fn restore(&mut self, _snapshot: &Snapshot<()>) -> Result<()> {
-        let current = self
-            .current
+        let vm = self
+            .vm
             .as_mut()
             .ok_or_else(|| anyhow!("restore() called before any run()"))?;
-        current.vm.restore().context("failed to restore snapshot")
+        vm.restore().context("failed to restore snapshot")
     }
 }
 
@@ -599,7 +525,6 @@ mod tests {
     #[test]
     fn unikraft_defaults() {
         let u = Unikraft::new("k");
-        assert_eq!(u.code_flag, DEFAULT_CODE_FLAG);
         assert_eq!(u.heap_size, DEFAULT_HEAP_SIZE);
         assert_eq!(u.stack_size, DEFAULT_STACK_SIZE);
         assert!(u.initrd.is_none());
@@ -609,19 +534,11 @@ mod tests {
     fn unikraft_builder_overrides() {
         let u = Unikraft::new("kernel")
             .initrd("rootfs.cpio")
-            .code_flag("-e")
             .heap_size(64 << 20)
             .stack_size(4 << 20);
         assert_eq!(u.kernel, PathBuf::from("kernel"));
         assert_eq!(u.initrd, Some(PathBuf::from("rootfs.cpio")));
-        assert_eq!(u.code_flag, "-e");
         assert_eq!(u.heap_size, 64 << 20);
         assert_eq!(u.stack_size, 4 << 20);
-    }
-
-    #[test]
-    fn argparse_escape_wraps_and_escapes() {
-        assert_eq!(argparse_escape("print(1)"), "\"print(1)\"");
-        assert_eq!(argparse_escape(r#"a "b" \c"#), r#""a \"b\" \\c""#);
     }
 }

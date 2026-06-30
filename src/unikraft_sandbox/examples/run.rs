@@ -1,30 +1,29 @@
-//! Boot a Unikraft guest image and run a Python snippet through the
+//! Boot a Unikraft resident-driver image and run a Python snippet through the
 //! `hyperlight-unikraft` backend of `hyperlight-sandbox`.
 //!
-//! This is the end-to-end smoke test. It needs a real Unikraft kernel + initrd whose entry
-//! interpreter accepts `-c <code>` (the upstream `examples/python` image is the reference)
-//! and a working hypervisor (`/dev/kvm` on Linux).
+//! This is the end-to-end smoke test. It needs a real Unikraft kernel + initrd built as a
+//! resident driver that exposes a `run` function taking the code string (the
+//! `python-agent-driver` image is the reference) and a working hypervisor (WHP on Windows,
+//! `/dev/kvm` on Linux).
 //!
-//! The backend runs each call as `python3 -c <code>` (argv) — exactly like the
-//! `hyperlight-unikraft --exec` CLI — and captures the guest console as `stdout`.
+//! The backend boots the driver once, then delivers each call's code via
+//! `Sandbox::run_code` and returns the guest exit code. In-band `stdout` capture is not
+//! wired yet (see the crate docs' C2 TODO), so the snippet's console output is not echoed —
+//! the `[timing]` lines' `exit=` is the observable result.
 //!
 //! Usage:
 //! ```text
 //! cargo run --example run -- <kernel> <initrd.cpio> ["<code>"]
 //! ```
 //!
-//! ## Using the upstream python image (console-enabled)
+//! ## Using the python-agent-driver image
 //! ```text
-//! cd hyperlight-unikraft/examples/python
-//! just build && just rootfs           # kernel + initrd (or pull the prebuilt kernel)
-//! cd ../../sandbox
-//! cargo run --example run -- \
-//!     ../examples/python/.unikraft/build/python-hyperlight_hyperlight-x86_64 \
-//!     ../examples/python/initrd.cpio \
-//!     "print('hello from a Unikraft micro-VM'); print(6 * 7)"
+//! # A CPython resident driver wants a large heap; match the image's bake.
+//! HL_UNIKRAFT_HEAP_MIB=1280 cargo run --example run -- \
+//!     <hl-pub>/kernel <hl-pub>/initrd.cpio "import sys; sys.exit(7)"
 //! ```
-//! The snippet's stdout is printed to your terminal. The example runs the same code twice
-//! so you can see the cold evolve vs the warm restore in the two `[timing]` lines.
+//! The example runs the snippet twice so you can see the cold boot (lazy driver start-up)
+//! vs the warm `run_code` in the two `[timing]` lines.
 //!
 //! ## Optional: a host filesystem mount (hostfs images only, e.g. `hostfs-posix-py`)
 //! ```text
@@ -71,8 +70,9 @@ fn main() -> Result<()> {
         .guest(guest)
         .build()?;
 
-    // Run the same code twice to show the model: the first call evolves a fresh VM (kernel
-    // boot + interpreter start-up); the second call of the *same* code is a warm restore.
+    // Run the snippet twice to show the model: the first call boots the resident driver
+    // (kernel boot + interpreter start-up); the second call is a warm `run_code` against the
+    // post-init snapshot — no re-boot, regardless of whether the code changed.
     let t = std::time::Instant::now();
     let cold = sandbox.run(&code)?;
     eprintln!(
