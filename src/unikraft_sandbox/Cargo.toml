@@ -14,12 +14,14 @@ description = "hyperlight-sandbox backend that runs guests inside Unikraft micro
 # wasmtime-free.
 hyperlight-sandbox = { path = "../hyperlight_sandbox", default-features = false }
 
-# The embedded Hyperlight + Unikraft host library (crate `hyperlight-unikraft-host`, lib
-# name `hyperlight_unikraft`). Lives in the hyperlight-unikraft repo (atop the
-# danbugs/hyperlight fork) and brings the snapshot-file + warm-start support this backend
-# relies on. Pinned by rev (not branch) so the dependency is deterministic and resolves from
-# the remote without anyone needing to clone or fork the repo; the branch keeps the rev alive.
-hyperlight-unikraft-host = { git = "https://github.com/simongdavies/hyperlight-unikraft", rev = "1d88a161cb2fcaeb3525f15a9e2afacb5f55c61b" }
+# The embedded Hyperlight + Unikraft host library (lib name `hyperlight_unikraft`).
+# RE-POINTED 2026-06-30 from the simongdavies/hyperlight-unikraft fork rev (atop the
+# danbugs/hyperlight warm-start fork, which BREAKS post-restore guest execution on WHP) to
+# the RELEASED crates.io crate, proven to execute + capture stdout on Windows/WHP.
+# Package renamed `hyperlight-unikraft-host` (fork) -> `hyperlight-unikraft` (released); both
+# expose lib `hyperlight_unikraft`, so `use hyperlight_unikraft::...` is unchanged.
+# NOTE: the released API may differ from the fork's — the build surfaces the port gaps.
+hyperlight-unikraft = "0.11.0"
 
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

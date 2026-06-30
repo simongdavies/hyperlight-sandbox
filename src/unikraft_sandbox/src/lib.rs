@@ -87,7 +87,7 @@ use hyperlight_sandbox::{
     HttpMethod, NetworkPermissions, SandboxConfig, Snapshot, ToolRegistry,
 };
 use hyperlight_unikraft::{
-    stderr_capture, Preopen, Sandbox as UnikraftVm, ToolRegistry as UnikraftTools,
+    stderr_capture, Preopen, Sandbox as UnikraftVm, SandboxBuilder,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -276,17 +276,16 @@ fn argparse_escape(code: &str) -> String {
 /// (`call_tool`/`read_file`/`write_file`/`fetch`) over `__dispatch`, so guest code cannot
 /// reach these until the driver gains a sandbox preamble. The `hostfs` POSIX path (file
 /// I/O via [`Unikraft::mount`]) works today regardless.
-fn build_host_tools(
+fn register_host_tools(
+    mut builder: SandboxBuilder,
     tools: Arc<ToolRegistry>,
     network: Arc<Mutex<NetworkPermissions>>,
     fs: Arc<Mutex<CapFs>>,
-) -> UnikraftTools {
-    let mut reg = UnikraftTools::new();
-
+) -> SandboxBuilder {
     // call_tool: forward to the core ToolRegistry.
     {
         let tools = tools.clone();
-        reg.register("call_tool", move |args: Value| -> Result<Value> {
+        builder = builder.tool("call_tool", move |args: Value| -> Result<Value> {
             let name = args
                 .get("name")
                 .and_then(Value::as_str)
@@ -299,7 +298,7 @@ fn build_host_tools(
     // read_file: core CapFs (read-only `/input`, writable `/output`).
     {
         let fs = fs.clone();
-        reg.register("read_file", move |args: Value| -> Result<Value> {
+        builder = builder.tool("read_file", move |args: Value| -> Result<Value> {
             let path = args
                 .get("path")
                 .and_then(Value::as_str)
@@ -315,7 +314,7 @@ fn build_host_tools(
     // write_file: text or bytes -> core CapFs `/output`.
     {
         let fs = fs.clone();
-        reg.register("write_file", move |args: Value| -> Result<Value> {
+        builder = builder.tool("write_file", move |args: Value| -> Result<Value> {
             let path = args
                 .get("path")
                 .and_then(Value::as_str)
@@ -340,7 +339,7 @@ fn build_host_tools(
     // fetch: host-side outbound HTTP, gated by the core NetworkPermissions.
     {
         let network = network.clone();
-        reg.register("fetch", move |args: Value| -> Result<Value> {
+        builder = builder.tool("fetch", move |args: Value| -> Result<Value> {
             let url_str = args
                 .get("url")
                 .and_then(Value::as_str)
@@ -396,7 +395,7 @@ fn build_host_tools(
         });
     }
 
-    reg
+    builder
 }
 
 impl UnikraftGuestSandbox {
@@ -449,8 +448,6 @@ impl UnikraftGuestSandbox {
     /// `build()` boots the kernel + runtime and captures the post-init warm snapshot that
     /// [`run_impl`](Self::run_impl) rewinds to before each `call_run`.
     fn evolve_for(&self, code: &str) -> Result<UnikraftVm> {
-        let registry = build_host_tools(self.tools.clone(), self.network.clone(), self.fs.clone());
-
         // `--exec`-style invocation: the guest interpreter is launched as
         // `<code_flag> <code>` (e.g. `python3 -c <code>`). The code is argparse-escaped so
         // the guest tokeniser keeps it as a single argv entry regardless of spaces/quotes.
@@ -459,11 +456,19 @@ impl UnikraftGuestSandbox {
         let mut builder = UnikraftVm::builder(&self.kernel)
             .args(args)
             .heap_size(self.heap_size)
-            .stack_size(self.stack_size)
-            .with_tools(registry);
-        if let Some(base) = self.initrd_base {
-            builder = builder.initrd_base(base);
-        }
+            .stack_size(self.stack_size);
+        // Bridge the core capabilities onto the builder's `__dispatch` host functions. The
+        // released hyperlight-unikraft exposes per-tool `.tool()`, not the fork's bulk
+        // `with_tools(registry)`.
+        builder = register_host_tools(
+            builder,
+            self.tools.clone(),
+            self.network.clone(),
+            self.fs.clone(),
+        );
+        // `initrd_base` is a fork-only builder option absent from the released crate, which
+        // places the initrd internally; accept-and-ignore to keep the public setter working.
+        let _ = self.initrd_base;
         if let Some(initrd) = &self.initrd {
             builder = builder.initrd_file(initrd.clone());
         }
