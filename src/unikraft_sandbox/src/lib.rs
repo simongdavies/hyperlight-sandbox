@@ -448,17 +448,14 @@ impl UnikraftGuestSandbox {
         let vm = self.vm.as_mut().expect("resident VM booted above");
 
         // `run_code` rewinds to the post-init warm snapshot, delivers `code` to the resident
-        // driver via the `run` guest function, and returns the guest exit code.
-        //
-        // TODO (C2): stdout is not yet captured in-band — the guest console (port 0xE9) is
-        // routed straight to the host's fd 2 and the released crate's `stderr_capture` is a
-        // Windows no-op. Until the driver returns the captured output per call, `stdout` is
-        // left empty; the exit code is authoritative.
+        // driver via the `run` guest function, and returns the guest's captured stdout/stderr
+        // (posted by the driver's `__hl_result` tool) plus its exit code. Against an older
+        // driver that does not post `__hl_result`, stdout/stderr come back empty.
         match vm.run_code(code) {
-            Ok(exit_code) => Ok(ExecutionResult {
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code,
+            Ok(output) => Ok(ExecutionResult {
+                stdout: output.stdout,
+                stderr: output.stderr,
+                exit_code: output.exit_code,
             }),
             // A guest trap surfaces as a failed execution rather than a hard error, matching
             // the JS backend.

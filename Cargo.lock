@@ -2081,7 +2081,7 @@ dependencies = [
 [[package]]
 name = "hyperlight-unikraft"
 version = "0.11.0"
-source = "git+https://github.com/simongdavies/hyperlight-unikraft?branch=feat%2Fplex-run-capture#de26443994fd9a2ad7708de5db12e646d48e65b6"
+source = "git+https://github.com/simongdavies/hyperlight-unikraft?branch=feat%2Fplex-run-capture#ebcaaed0c962228354fb5b46ebc77e0d0373f184"
 dependencies = [
  "anyhow",
  "base64",
