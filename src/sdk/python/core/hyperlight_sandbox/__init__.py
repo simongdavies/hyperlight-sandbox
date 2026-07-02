@@ -80,11 +80,31 @@ def _load_backend(backend: str):
     return normalized, NativeJSSandbox
 
 
+def load_golden(directory: str):
+    """Load a warm golden snapshot into a shareable handle for the Unikraft backend.
+
+    The snapshot directory is produced by baking the guest once (``bake`` / ``pyhl setup``).
+    Load the golden a single time per process, then pass the returned handle as ``golden=`` to
+    any number of ``Sandbox(backend="unikraft", golden=...)`` constructions: Hyperlight maps the
+    golden memory copy-on-write, so the sandboxes share its pages and each only pays for what it
+    dirties. This is the fast, concurrency-safe ``from_snapshot`` execution path.
+    """
+    try:
+        from hyperlight_sandbox_backend_unikraft import load_golden as _native_load_golden
+    except ImportError as exc:
+        raise ImportError(
+            "The Unikraft backend is not installed. Install the local "
+            "hyperlight-sandbox-backend-unikraft package."
+        ) from exc
+    return _native_load_golden(directory)
+
+
 __all__ = [
     "CodeExecutionTool",
     "ExecutionResult",
     "Sandbox",
     "SandboxEnvironment",
+    "load_golden",
     "__version__",
 ]
 
@@ -133,26 +153,36 @@ class Sandbox:
         kernel: str | None = None,
         initrd: str | None = None,
         initrd_base: int | None = None,
+        golden: Any | None = None,
     ) -> None:
         normalized_backend, native_cls = _load_backend(backend)
 
         if normalized_backend == "unikraft":
-            # The Unikraft backend boots a kernel + initrd rather than loading a packaged
-            # guest module, so it takes an explicit image instead of module/module_path.
-            if kernel is None:
+            # The Unikraft backend either cold-boots a kernel + initrd, or builds from a
+            # pre-loaded golden snapshot (the fast, concurrency-safe `from_snapshot` path).
+            # Exactly one of `kernel` / `golden` is required.
+            if golden is None and kernel is None:
                 raise ValueError(
-                    "backend='unikraft' requires 'kernel' (path to the unikernel image)."
+                    "backend='unikraft' requires either 'kernel' (cold boot) or 'golden' "
+                    "(a handle from load_golden(), the fast from_snapshot path)."
                 )
-            uni_kwargs: dict[str, Any] = {
-                "kernel": kernel,
-                "heap_size": heap_size if heap_size is not None else _DEFAULT_UNIKRAFT_HEAP_SIZE,
-            }
+            uni_kwargs: dict[str, Any] = {}
+            if golden is not None:
+                # heap/stack/kernel are baked into the golden; do not re-specify them.
+                uni_kwargs["golden"] = golden
+            else:
+                uni_kwargs["kernel"] = kernel
+                uni_kwargs["heap_size"] = (
+                    heap_size if heap_size is not None else _DEFAULT_UNIKRAFT_HEAP_SIZE
+                )
+                if stack_size is not None:
+                    uni_kwargs["stack_size"] = stack_size
+                if initrd_base is not None:
+                    uni_kwargs["initrd_base"] = initrd_base
+            # `initrd` applies to both paths: a non-inline golden still re-maps it; an inline
+            # golden leaves it unset.
             if initrd is not None:
                 uni_kwargs["initrd"] = initrd
-            if initrd_base is not None:
-                uni_kwargs["initrd_base"] = initrd_base
-            if stack_size is not None:
-                uni_kwargs["stack_size"] = stack_size
             if input_dir is not None:
                 uni_kwargs["input_dir"] = input_dir
             if output_dir is not None:

@@ -22,8 +22,8 @@ use hyperlight_sandbox::{
 use hyperlight_sandbox_pyo3_common::{
     PyExecutionResult, build_tool_registry, parse_size, parse_tool_registration,
 };
-use hyperlight_unikraft_sandbox::Unikraft;
-use pyo3::exceptions::PyRuntimeError;
+use hyperlight_unikraft_sandbox::{Unikraft, UnikraftGolden};
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 type UnikraftSandboxInner = Sandbox<Unikraft>;
@@ -87,7 +87,11 @@ pub struct UnikraftSandbox {
     tools: HashMap<String, Py<PyAny>>,
     pending_networks: Vec<(String, Option<Vec<String>>)>,
     pending_credentials: Vec<PendingCredential>,
-    kernel: String,
+    /// Cold-boot kernel path. `None` when building from a `golden` snapshot instead.
+    kernel: Option<String>,
+    /// Pre-loaded golden snapshot; when set, sandboxes are built via `from_snapshot`
+    /// (fast, concurrency-safe) rather than cold-booting `kernel`.
+    golden: Option<UnikraftGolden>,
     initrd: Option<String>,
     initrd_base: Option<u64>,
     heap_size: Option<u64>,
@@ -100,10 +104,10 @@ pub struct UnikraftSandbox {
 #[pymethods]
 impl UnikraftSandbox {
     #[new]
-    #[pyo3(signature = (kernel, initrd=None, initrd_base=None, input_dir=None, output_dir=None, temp_output=false, heap_size=None, stack_size=None))]
+    #[pyo3(signature = (kernel=None, initrd=None, initrd_base=None, input_dir=None, output_dir=None, temp_output=false, heap_size=None, stack_size=None, golden=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
-        kernel: &str,
+        kernel: Option<&str>,
         initrd: Option<&str>,
         initrd_base: Option<u64>,
         input_dir: Option<&str>,
@@ -111,13 +115,20 @@ impl UnikraftSandbox {
         temp_output: bool,
         heap_size: Option<&str>,
         stack_size: Option<&str>,
+        golden: Option<&Golden>,
     ) -> PyResult<Self> {
+        if kernel.is_none() && golden.is_none() {
+            return Err(PyValueError::new_err(
+                "UnikraftSandbox requires either `kernel` (cold boot) or `golden` (from_snapshot)",
+            ));
+        }
         Ok(UnikraftSandbox {
             inner: None,
             tools: HashMap::new(),
             pending_networks: Vec::new(),
             pending_credentials: Vec::new(),
-            kernel: kernel.to_string(),
+            kernel: kernel.map(|s| s.to_string()),
+            golden: golden.map(|g| g.inner.clone()),
             initrd: initrd.map(|s| s.to_string()),
             initrd_base,
             // VM sizing is expressed in bytes on the `Unikraft` builder; parse the
@@ -161,19 +172,34 @@ impl UnikraftSandbox {
 
             // VM sizing lives on the `Unikraft` guest (the backend deliberately ignores the
             // generic SandboxConfig heap/stack, which are tuned for in-process Wasm/JS).
-            let mut guest = Unikraft::new(self.kernel.clone());
-            if let Some(ref initrd) = self.initrd {
-                guest = guest.initrd(initrd.clone());
-            }
-            if let Some(heap) = self.heap_size {
-                guest = guest.heap_size(heap);
-            }
-            if let Some(stack) = self.stack_size {
-                guest = guest.stack_size(stack);
-            }
-            if let Some(base) = self.initrd_base {
-                guest = guest.initrd_base(base);
-            }
+            // Build the guest either from a pre-loaded golden (fast `from_snapshot` path) or by
+            // cold-booting a kernel. On the golden path the kernel/heap/stack are baked in; only a
+            // non-inline initrd would still be re-mapped (an inline golden leaves initrd `None`).
+            let guest = if let Some(golden) = &self.golden {
+                let mut g = Unikraft::from_golden(golden.clone());
+                if let Some(ref initrd) = self.initrd {
+                    g = g.initrd(initrd.clone());
+                }
+                g
+            } else {
+                let kernel = self.kernel.as_ref().ok_or_else(|| {
+                    PyRuntimeError::new_err("UnikraftSandbox has neither kernel nor golden")
+                })?;
+                let mut g = Unikraft::new(kernel.clone());
+                if let Some(ref initrd) = self.initrd {
+                    g = g.initrd(initrd.clone());
+                }
+                if let Some(heap) = self.heap_size {
+                    g = g.heap_size(heap);
+                }
+                if let Some(stack) = self.stack_size {
+                    g = g.stack_size(stack);
+                }
+                if let Some(base) = self.initrd_base {
+                    g = g.initrd_base(base);
+                }
+                g
+            };
 
             let mut builder = SandboxBuilder::new().with_tools(registry).guest(guest);
             if let Some(ref dir) = self.input_dir {
@@ -215,8 +241,14 @@ impl UnikraftSandbox {
             self.inner = Some(sandbox);
         }
         let sandbox = self.inner.as_mut().unwrap();
-        let result = sandbox
-            .run(code)
+        // Release the GIL for the duration of the blocking micro-VM execution. A pool holds one
+        // sandbox per dedicated worker thread; without this, every worker would serialise on the
+        // interpreter lock and the pool would run guests one-at-a-time regardless of its size.
+        // Guest tool callbacks and credential resolvers re-acquire the GIL via `Python::attach`
+        // (see `build_tool_registry` / `python_callable_to_resolver`), so dropping it here is
+        // sound even when tools are registered — the callback path re-attaches on demand.
+        let result = py
+            .detach(|| sandbox.run(code))
             .map_err(|e| PyRuntimeError::new_err(format!("Execution failed: {e}")))?;
         Ok(PyExecutionResult {
             stdout: result.stdout,
@@ -322,11 +354,32 @@ impl UnikraftSandbox {
     }
 }
 
+/// A loaded golden snapshot handle, shareable across many `UnikraftSandbox` instances.
+///
+/// Load once with [`load_golden`], then pass the same handle as the `golden=` argument to every
+/// sandbox: Hyperlight maps the golden memory copy-on-write, so they share its physical pages and
+/// each only pays for what it dirties.
+#[pyclass]
+pub struct Golden {
+    inner: UnikraftGolden,
+}
+
+/// Load a warm golden snapshot directory (produced by `bake` / `pyhl setup`) into a shareable
+/// [`Golden`] handle. Load once per process and reuse for every sandbox.
+#[pyfunction]
+fn load_golden(dir: &str) -> PyResult<Golden> {
+    let inner = Unikraft::load_golden(dir)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to load golden snapshot: {e:#}")))?;
+    Ok(Golden { inner })
+}
+
 #[pymodule]
 fn _native_unikraft(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<UnikraftSandbox>()?;
     m.add_class::<PyExecutionResult>()?;
     m.add_class::<PySnapshot>()?;
+    m.add_class::<Golden>()?;
+    m.add_function(wrap_pyfunction!(load_golden, m)?)?;
     m.add("__version__", "0.1.0")?;
     Ok(())
 }

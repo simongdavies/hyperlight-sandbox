@@ -77,7 +77,7 @@
 //! [`hyperlight-sandbox`]: hyperlight_sandbox
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
@@ -86,7 +86,9 @@ use hyperlight_sandbox::{
     http as sandbox_http, CapFs, CredentialRegistry, ExecutionResult, Guest, GuestSandbox,
     HttpMethod, NetworkPermissions, SandboxConfig, Snapshot, ToolRegistry,
 };
-use hyperlight_unikraft::{Preopen, Sandbox as UnikraftVm, SandboxBuilder};
+use hyperlight_unikraft::{
+    Preopen, Sandbox as UnikraftVm, SandboxBuilder, Snapshot as UnikraftSnapshot,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -119,6 +121,21 @@ const DEFAULT_STACK_SIZE: u64 = 8 * 1024 * 1024;
 /// println!("{}", out.stdout);
 /// # Ok::<(), anyhow::Error>(())
 /// ```
+/// A loaded golden snapshot, shareable across many sandboxes.
+///
+/// Load it **once** per process with [`Unikraft::load_golden`], then hand a clone to every
+/// [`Unikraft::from_golden`]: Hyperlight maps the golden memory copy-on-write, so N sandboxes
+/// built from the same handle share its physical pages and only pay for what they dirty.
+/// Cloning is cheap (an `Arc` bump).
+#[derive(Clone)]
+pub struct UnikraftGolden(Arc<UnikraftSnapshot>);
+
+impl std::fmt::Debug for UnikraftGolden {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnikraftGolden").finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Unikraft {
     kernel: PathBuf,
@@ -127,6 +144,9 @@ pub struct Unikraft {
     stack_size: u64,
     initrd_base: Option<u64>,
     mounts: Vec<(PathBuf, String)>,
+    /// When set, the sandbox is created from this warm golden via `from_snapshot` instead of
+    /// cold-booting a kernel — much faster per exec and concurrency-safe.
+    golden: Option<UnikraftGolden>,
 }
 
 impl Unikraft {
@@ -140,6 +160,34 @@ impl Unikraft {
             stack_size: DEFAULT_STACK_SIZE,
             initrd_base: None,
             mounts: Vec::new(),
+            golden: None,
+        }
+    }
+
+    /// Load a warm golden snapshot from `dir` (produced by `bake` / `pyhl setup`) into a
+    /// shareable [`UnikraftGolden`] handle. Load once, then build many sandboxes from it via
+    /// [`from_golden`](Self::from_golden) — they share the golden memory copy-on-write.
+    pub fn load_golden(dir: impl AsRef<Path>) -> Result<UnikraftGolden> {
+        let snapshot =
+            UnikraftVm::load_snapshot(dir).context("failed to load golden snapshot directory")?;
+        Ok(UnikraftGolden(snapshot))
+    }
+
+    /// Build sandboxes from a pre-loaded [`UnikraftGolden`] (see [`load_golden`](Self::load_golden))
+    /// instead of cold-booting a kernel. The kernel — and, for an inline-baked golden, the initrd —
+    /// are captured in the golden, so neither is re-mapped per sandbox. This is the fast,
+    /// concurrency-safe path (a fresh VM per execution from an immutable shared golden).
+    pub fn from_golden(golden: UnikraftGolden) -> Self {
+        Self {
+            // Unused on the golden path: the kernel is baked into the golden. Kept non-optional
+            // so the cold-boot builder stays ergonomic; never read when `golden` is `Some`.
+            kernel: PathBuf::new(),
+            initrd: None,
+            heap_size: DEFAULT_HEAP_SIZE,
+            stack_size: DEFAULT_STACK_SIZE,
+            initrd_base: None,
+            mounts: Vec::new(),
+            golden: Some(golden),
         }
     }
 
@@ -213,6 +261,9 @@ pub struct UnikraftGuestSandbox {
     tools: Arc<ToolRegistry>,
     network: Arc<Mutex<NetworkPermissions>>,
     fs: Arc<Mutex<CapFs>>,
+    /// When set, the VM is created from this shared warm golden (`from_snapshot`) rather than
+    /// cold-booted. The kernel/initrd baked into the golden are not re-mapped per sandbox.
+    golden: Option<UnikraftGolden>,
     /// The resident micro-VM, booted lazily on first run and warm-reused thereafter.
     vm: Option<UnikraftVm>,
 }
@@ -382,6 +433,7 @@ impl UnikraftGuestSandbox {
             stack_size,
             initrd_base,
             mounts,
+            golden,
         } = backend;
 
         // Map requested host directories to guest `hostfs` preopens once; applied when the
@@ -401,6 +453,7 @@ impl UnikraftGuestSandbox {
             tools: Arc::new(tools),
             network,
             fs,
+            golden,
             vm: None,
         })
     }
@@ -410,6 +463,26 @@ impl UnikraftGuestSandbox {
     /// driver's init and captures the post-init warm snapshot that
     /// [`run_code`](hyperlight_unikraft::Sandbox::run_code) rewinds to before each call.
     fn evolve(&self) -> Result<UnikraftVm> {
+        // Golden (from_snapshot) path: create a fresh VM from the shared warm snapshot. The
+        // kernel and (for an inline golden) the initrd are baked into the golden, so neither is
+        // cold-booted or re-mapped. This is the fast, concurrency-safe construction.
+        //
+        // NOTE: custom host tools (`call_tool`/`fetch`) are not yet wired on this path — the
+        // underlying `from_snapshot` builds only the built-in result-capture + hostfs tools, so
+        // stdout/stderr capture and `hostfs` mounts work, but the SDK ToolRegistry bridge does
+        // not (same limitation as the cold-boot `__dispatch` bridge TODO). Sufficient for the
+        // tool-less execution MVP; full parity needs a tools-aware `from_snapshot` upstream.
+        if let Some(golden) = &self.golden {
+            return UnikraftVm::from_snapshot(
+                golden.0.clone(),
+                &self.preopens,
+                self.initrd.clone(),
+                None,
+                None,
+            )
+            .context("failed to create Unikraft VM from golden snapshot");
+        }
+
         let mut builder = UnikraftVm::builder(&self.kernel)
             .heap_size(self.heap_size)
             .stack_size(self.stack_size);
