@@ -27,6 +27,11 @@ else:
     _DEFAULT_HEAP_SIZE = "25Mi"
     _DEFAULT_STACK_SIZE = "35Mi"
 
+# The Unikraft backend boots a full unikernel language runtime (e.g. CPython) rather than an
+# in-process Wasm/JS engine, so it needs a much larger guest heap. This matches the size used
+# to bake the python-agent-driver golden image.
+_DEFAULT_UNIKRAFT_HEAP_SIZE = "1280Mi"
+
 
 def _normalize_backend(backend: str) -> str:
     normalized = backend.strip().lower().replace("_", "-")
@@ -34,7 +39,11 @@ def _normalize_backend(backend: str) -> str:
         return "wasm"
     if normalized in {"javascript", "js", "hyperlight-js"}:
         return "hyperlight-js"
-    raise ValueError(f"Unknown backend '{backend}'. Expected 'wasm' or 'hyperlight-js'.")
+    if normalized == "unikraft":
+        return "unikraft"
+    raise ValueError(
+        f"Unknown backend '{backend}'. Expected 'wasm', 'hyperlight-js' or 'unikraft'."
+    )
 
 
 def _load_backend(backend: str):
@@ -48,6 +57,18 @@ def _load_backend(backend: str):
                 "or install the local hyperlight-sandbox-backend-wasm package."
             ) from exc
         return normalized, NativeWasmSandbox
+
+    if normalized == "unikraft":
+        try:
+            from hyperlight_sandbox_backend_unikraft import (
+                UnikraftSandbox as NativeUnikraftSandbox,
+            )
+        except ImportError as exc:
+            raise ImportError(
+                "The Unikraft backend is not installed. Install the local "
+                "hyperlight-sandbox-backend-unikraft package."
+            ) from exc
+        return normalized, NativeUnikraftSandbox
 
     try:
         from hyperlight_sandbox_backend_hyperlight_js import JSSandbox as NativeJSSandbox
@@ -109,12 +130,42 @@ class Sandbox:
         module_path: str | None = None,
         heap_size: str | None = None,
         stack_size: str | None = None,
+        kernel: str | None = None,
+        initrd: str | None = None,
+        initrd_base: int | None = None,
     ) -> None:
+        normalized_backend, native_cls = _load_backend(backend)
+
+        if normalized_backend == "unikraft":
+            # The Unikraft backend boots a kernel + initrd rather than loading a packaged
+            # guest module, so it takes an explicit image instead of module/module_path.
+            if kernel is None:
+                raise ValueError(
+                    "backend='unikraft' requires 'kernel' (path to the unikernel image)."
+                )
+            uni_kwargs: dict[str, Any] = {
+                "kernel": kernel,
+                "heap_size": heap_size if heap_size is not None else _DEFAULT_UNIKRAFT_HEAP_SIZE,
+            }
+            if initrd is not None:
+                uni_kwargs["initrd"] = initrd
+            if initrd_base is not None:
+                uni_kwargs["initrd_base"] = initrd_base
+            if stack_size is not None:
+                uni_kwargs["stack_size"] = stack_size
+            if input_dir is not None:
+                uni_kwargs["input_dir"] = input_dir
+            if output_dir is not None:
+                uni_kwargs["output_dir"] = output_dir
+            if temp_output:
+                uni_kwargs["temp_output"] = True
+            self._inner = native_cls(**uni_kwargs)
+            return
+
         if heap_size is None:
             heap_size = _DEFAULT_HEAP_SIZE
         if stack_size is None:
             stack_size = _DEFAULT_STACK_SIZE
-        normalized_backend, native_cls = _load_backend(backend)
         effective_module = module
         if module_path is not None and module == DEFAULT_MODULE_REF:
             effective_module = None

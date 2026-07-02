@@ -1,0 +1,21 @@
+[package]
+name = "hyperlight-sandbox-backend-unikraft"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Unikraft micro-VM backend bindings for hyperlight-sandbox"
+
+[lib]
+name = "_native_unikraft"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3.workspace = true
+# Direct path dep with `default-features = false` (not workspace inheritance, which cannot
+# override default-features) so this backend drops the core's wasi-http/wasmtime stack it
+# never uses. Mirrors the `hyperlight-unikraft-sandbox` crate. Feature unification keeps the
+# wasm/js backends' wasmtime intact because they pull the core with default features.
+hyperlight-sandbox = { path = "../../../hyperlight_sandbox", default-features = false }
+hyperlight-unikraft-sandbox.workspace = true
+hyperlight-sandbox-pyo3-common.workspace = true
